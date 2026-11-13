@@ -54,7 +54,6 @@ function obterCache(chave) {
 }
 
 function salvarCache(chave, valor, duracaoMs) {
-  // Evita crescimento ilimitado do cache.
   if (cache.size > 500) {
     const primeiraChave = cache.keys().next().value;
     cache.delete(primeiraChave);
@@ -72,9 +71,6 @@ const CACHE_GEOCODIFICACAO = 24 * 60 * 60 * 1000;
 // ==========================================
 // CONTROLE DE CONSULTAS AO NOMINATIM
 // ==========================================
-
-// O Nominatim público exige uso moderado.
-// Mantemos pelo menos 1 segundo entre consultas.
 
 let filaNominatim = Promise.resolve();
 let ultimaConsultaNominatim = 0;
@@ -107,39 +103,133 @@ async function consultarNominatim(url) {
 }
 
 // ==========================================
-// REQUISIÇÕES EXTERNAS
+// REQUISIÇÕES EXTERNAS COM NOVAS TENTATIVAS
 // ==========================================
 
 async function requisicao(url, opcoes = {}) {
-  let resposta;
+  const tentativas = 3;
+  let ultimoErro;
 
-  try {
-    resposta = await fetch(url, {
-      ...opcoes,
-      signal: AbortSignal.timeout(15000)
-    });
-  } catch (erro) {
-    if (erro.name === "TimeoutError") {
-      throw new Error("O serviço externo demorou para responder. Tente novamente.");
+  for (let tentativa = 1; tentativa <= tentativas; tentativa++) {
+    try {
+      const resposta = await fetch(url, {
+        ...opcoes,
+        signal: AbortSignal.timeout(15000)
+      });
+
+      if (!resposta.ok) {
+        if (
+          resposta.status === 429 ||
+          resposta.status === 502 ||
+          resposta.status === 503 ||
+          resposta.status === 504
+        ) {
+          throw new Error(
+            resposta.status === 429
+              ? "O serviço recebeu muitas consultas."
+              : "O serviço externo está temporariamente indisponível."
+          );
+        }
+
+        throw new Error(
+          `O serviço externo respondeu com erro ${resposta.status}.`
+        );
+      }
+
+      const dados = await resposta.json();
+
+      // Algumas APIs retornam HTTP 200 mesmo quando estão sobrecarregadas.
+      if (dados.error === true) {
+        const motivo = String(dados.reason || "").toLowerCase();
+
+        if (
+          motivo.includes("overloaded") ||
+          motivo.includes("temporarily unavailable")
+        ) {
+          throw new Error(
+            "O serviço meteorológico está sobrecarregado."
+          );
+        }
+
+        throw new Error(
+          dados.reason || "O serviço externo retornou um erro."
+        );
+      }
+
+      return dados;
+
+    } catch (erro) {
+      ultimoErro = erro;
+
+      const mensagem = String(erro.message || "").toLowerCase();
+
+      const erroTemporario =
+        erro.name === "TimeoutError" ||
+        erro.name === "AbortError" ||
+        mensagem.includes("fetch failed") ||
+        mensagem.includes("overloaded") ||
+        mensagem.includes("sobrecarregado") ||
+        mensagem.includes("temporariamente indisponível") ||
+        mensagem.includes("muitas consultas");
+
+      if (!erroTemporario || tentativa === tentativas) {
+        break;
+      }
+
+      const intervalo = tentativa * 1500;
+
+      console.log(
+        `Tentativa ${tentativa} falhou. Nova tentativa em ${intervalo}ms.`
+      );
+
+      await aguardar(intervalo);
     }
-
-    throw new Error("Não foi possível conectar ao serviço externo.");
   }
 
-  if (!resposta.ok) {
-    if (resposta.status === 429) {
-      throw new Error("O serviço recebeu muitas consultas. Aguarde um pouco e tente novamente.");
-    }
+  const mensagem = String(ultimoErro?.message || "");
 
-    if (resposta.status === 503 || resposta.status === 502) {
-      throw new Error("O serviço externo está temporariamente indisponível.");
-    }
-
-    throw new Error(`O serviço externo respondeu com erro ${resposta.status}.`);
+  if (
+    ultimoErro?.name === "TimeoutError" ||
+    ultimoErro?.name === "AbortError"
+  ) {
+    throw new Error(
+      "O serviço externo demorou para responder. Tente novamente."
+    );
   }
 
-  return resposta.json();
+  if (mensagem.toLowerCase().includes("muitas consultas")) {
+    throw new Error(
+      "O serviço recebeu muitas consultas. Aguarde um pouco e tente novamente."
+    );
+  }
+
+  if (
+    mensagem.toLowerCase().includes("overloaded") ||
+    mensagem.toLowerCase().includes("sobrecarregado")
+  ) {
+    throw new Error(
+      "O serviço meteorológico está sobrecarregado. Tente novamente em alguns minutos."
+    );
+  }
+
+  if (mensagem.toLowerCase().includes("temporariamente indisponível")) {
+    throw new Error(mensagem);
+  }
+
+  if (mensagem.toLowerCase().includes("fetch failed")) {
+    throw new Error(
+      "Não foi possível conectar ao serviço externo."
+    );
+  }
+
+  throw ultimoErro || new Error(
+    "Não foi possível concluir a consulta externa."
+  );
 }
+
+// ==========================================
+// VALIDAÇÃO E TRATAMENTO DE ERROS
+// ==========================================
 
 function validarCoordenadas(latitude, longitude) {
   return (
@@ -154,7 +244,7 @@ function validarCoordenadas(latitude, longitude) {
 
 function mensagemErro(erro) {
   console.error("Erro no servidor:", erro);
-  return erro.message || "Não foi possível concluir a consulta. Tente novamente.";
+  return erro.message || "Não foi possível concluir a consulta.";
 }
 
 function enviarErro(res, erro, statusPadrao = 502) {
@@ -164,7 +254,8 @@ function enviarErro(res, erro, statusPadrao = 502) {
 
   if (
     mensagem.includes("muitas consultas") ||
-    mensagem.includes("temporariamente indisponível")
+    mensagem.includes("temporariamente indisponível") ||
+    mensagem.includes("sobrecarregado")
   ) {
     return res.status(503).json({ erro: mensagem });
   }
@@ -198,6 +289,7 @@ async function buscarLocal(cidade) {
   }
 
   const local = dados.results[0];
+
   salvarCache(chave, local, CACHE_GEOCODIFICACAO);
 
   return local;
@@ -293,8 +385,11 @@ app.get("/weather/:cidade", async (req, res) => {
       longitude: Number(local.longitude),
       clima
     });
+
   } catch (erro) {
-    const status = erro.message === "Cidade não encontrada." ? 404 : 502;
+    const status =
+      erro.message === "Cidade não encontrada." ? 404 : 502;
+
     enviarErro(res, erro, status);
   }
 });
@@ -314,7 +409,9 @@ app.get("/weather-location", async (req, res) => {
       });
     }
 
-    const chave = `clima-completo:${latitude.toFixed(3)}:${longitude.toFixed(3)}`;
+    const chave =
+      `clima-completo:${latitude.toFixed(3)}:${longitude.toFixed(3)}`;
+
     let dados = obterCache(chave);
 
     if (!dados) {
@@ -336,6 +433,7 @@ app.get("/weather-location", async (req, res) => {
       timezone: dados.timezone,
       clima: formatarClima(dados.current)
     });
+
   } catch (erro) {
     enviarErro(res, erro);
   }
@@ -356,7 +454,9 @@ app.get("/reverse-geocode", async (req, res) => {
       });
     }
 
-    const chave = `reverse:${latitude.toFixed(4)}:${longitude.toFixed(4)}`;
+    const chave =
+      `reverse:${latitude.toFixed(4)}:${longitude.toFixed(4)}`;
+
     let dados = obterCache(chave);
 
     if (!dados) {
@@ -366,6 +466,7 @@ app.get("/reverse-geocode", async (req, res) => {
         "&format=jsonv2&accept-language=pt-BR";
 
       dados = await consultarNominatim(url);
+
       salvarCache(chave, dados, CACHE_GEOCODIFICACAO);
     }
 
@@ -396,6 +497,7 @@ app.get("/reverse-geocode", async (req, res) => {
       latitude,
       longitude
     });
+
   } catch (erro) {
     enviarErro(res, erro);
   }
@@ -445,6 +547,7 @@ app.get("/geocode/:bairro", async (req, res) => {
     }
 
     res.json(dados);
+
   } catch (erro) {
     enviarErro(res, erro);
   }
@@ -471,6 +574,7 @@ app.get("/api/occurrences", async (req, res) => {
 
     res.set("Cache-Control", "no-store");
     res.json(data || []);
+
   } catch (erro) {
     enviarErro(res, erro, 500);
   }
@@ -561,6 +665,7 @@ app.post("/api/occurrences", async (req, res) => {
       mensagem: "Relato registrado com sucesso.",
       ocorrencia: data
     });
+
   } catch (erro) {
     enviarErro(res, erro, 500);
   }
